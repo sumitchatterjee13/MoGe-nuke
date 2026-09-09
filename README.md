@@ -14,6 +14,16 @@ Python daemon; the Nuke node is an OFX plugin that sends each frame to it over
 localhost and gets depth, normals and a validity mask back. The daemon is
 started automatically on first use and shuts down when Nuke does.
 
+## Model weights
+
+**[huggingface.co/Sumitc13/moge-3-vitg-safetensors](https://huggingface.co/Sumitc13/moge-3-vitg-safetensors)**
+
+Microsoft's MoGe-3 ViT-G checkpoint converted 1:1 to safetensors (same
+weights, MIT), self-describing (the model config travels in the file header)
+and memory-mapped on load. The installer downloads it into `models/`; the
+original `model.pt` from [Ruicheng/moge-3-vitg](https://huggingface.co/Ruicheng/moge-3-vitg)
+works too. Checksums for both are in [docs/OFFLINE.md](docs/OFFLINE.md).
+
 ## Requirements
 
 * NVIDIA GPU with 12 GB+ VRAM (peak measured: 7.9 GB at 1080p, refine 3).
@@ -60,7 +70,7 @@ Air-gapped machines, render farms and security notes: [docs/OFFLINE.md](docs/OFF
 ## The node
 
 | MoGe tab | |
-|---|---|
+| --- | --- |
 | model | local `.safetensors` / `.pt`, or a Hugging Face repo id |
 | output | **depth**: RGB = metric depth, A = mask. **normals**: RGB = normal, A = mask |
 | refine steps | 0 (refiner off) to 5. 3 is MoGe's default. Depth only; normals are identical at every setting |
@@ -73,7 +83,7 @@ Air-gapped machines, render farms and security notes: [docs/OFFLINE.md](docs/OFF
 | apply mask | zero depth/normals where the model marks pixels invalid (sky). The mask is always in alpha |
 
 | Setup tab | |
-|---|---|
+| --- | --- |
 | python / daemon script | the venv interpreter and `daemon/moge_daemon.py`; filled in by the installer |
 | port | 47821 |
 | auto-start daemon | launch the daemon when nothing answers on the port |
@@ -89,7 +99,7 @@ reply is cached per node on the source pixels and the inference knobs.
 
 `daemon/moge_daemon.py` is a plain TCP server you can also drive yourself:
 
-```
+```text
 .venv/bin/python daemon/moge_daemon.py              # foreground, default port
 .venv/bin/python daemon/moge_client.py info
 .venv/bin/python daemon/moge_client.py infer image.png --out result.exr
@@ -103,7 +113,7 @@ at the top of `moge_daemon.py`; `moge_client.py` is the reference client.
 
 ## Building the plugin
 
-```
+```text
 ./ofx/build.sh                                            # Linux
 powershell -ExecutionPolicy Bypass -File ofx\build.ps1    # Windows
 ```
@@ -121,7 +131,7 @@ fill in the Setup tab by hand.
 
 ## Tests
 
-```
+```text
 .venv/bin/python daemon/test_moge_daemon.py   # protocol + parity with model.infer()
 .venv/bin/python ofx/tests/test_plugin.py     # the built .ofx through a mini OFX host, no Nuke needed
 .venv/bin/python tools/warmup.py              # load + time the model, populate the Triton cache
