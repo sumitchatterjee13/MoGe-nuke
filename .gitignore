@@ -1,0 +1,15 @@
+# environment and downloads
+.venv/
+.venv*/
+models/*
+!models/.gitkeep
+
+# build products
+ofx/build/
+__pycache__/
+*.pyc
+*.egg-info/
+
+# renders / tests
+output/
+*.exr
