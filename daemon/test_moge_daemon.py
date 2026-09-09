@@ -31,7 +31,17 @@ import numpy as np
 from moge_client import Client, DaemonError
 
 PORT = 47899
-MODEL = os.environ.get("MOGE_TEST_MODEL") or os.path.join(ROOT, "models", "moge-3-vitg.pt")
+def _find_model():
+    if os.environ.get("MOGE_TEST_MODEL"):
+        return os.environ["MOGE_TEST_MODEL"]
+    for name in ("moge-3-vitg.safetensors", "moge-3-vitg.pt"):
+        cand = os.path.join(ROOT, "models", name)
+        if os.path.isfile(cand):
+            return cand
+    return os.path.join(ROOT, "models", "moge-3-vitg.safetensors")
+
+
+MODEL = _find_model()
 IMAGE = os.path.join(ROOT, "docs", "sample.jpg")
 
 

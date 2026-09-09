@@ -1,6 +1,7 @@
 # MoGe-nuke installer (Windows).
 #
 #   powershell -ExecutionPolicy Bypass -File install.ps1 [-Cuda cu128] [-SkipModel] [-SkipBuild]
+#                                                       [-Offline WHEELHOUSE] [-Python path\to\python.exe]
 #
 # 1. creates .venv with uv (Python 3.12) and installs torch + MoGe + Triton
 # 2. downloads the MoGe-3 checkpoint to models\ (about 5 GB, skip with -SkipModel)
@@ -8,13 +9,19 @@
 #    ofx\prebuilt, and installs it where Nuke looks for OFX plugins
 # 4. registers nuke\ with Nuke (adds nuke.pluginAddPath to ~\.nuke\init.py)
 #
+# -Offline WHEELHOUSE installs from a directory made by tools\make_wheelhouse.ps1
+# on a connected machine (see docs\OFFLINE.md); the model must already be in
+# models\. -Python picks the interpreter for the venv (offline machines).
+#
 # Re-running is safe; each step skips what is already done.
 param(
     [string]$Cuda = "cu128",     # torch wheel index: cu126 / cu128 / cu130 ...
     [switch]$SkipModel,
     [switch]$SkipBuild,
     [switch]$Prebuilt,           # force the prebuilt .ofx even if VS is available
-    [string]$OfxDir = ""         # override the OFX plugin directory
+    [string]$OfxDir = "",        # override the OFX plugin directory
+    [string]$Offline = "",       # wheelhouse directory for air-gapped installs
+    [string]$Python = ""         # interpreter to build the venv from (default: uv-managed 3.12)
 )
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -40,27 +47,39 @@ Step "Python environment"
 if (-not (Get-Command uv -ErrorAction SilentlyContinue)) {
     throw "uv not found. Install it with:  powershell -c `"irm https://astral.sh/uv/install.ps1 | iex`"  then re-run."
 }
-if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
+if (-not $Offline -and -not (Get-Command git -ErrorAction SilentlyContinue)) {
     throw "git not found (MoGe's dependencies are installed from GitHub). Install Git for Windows and re-run."
 }
+if ($Offline) { $Offline = (Resolve-Path $Offline).Path }
 $venv = Join-Path $root ".venv"
 $py = Join-Path $venv "Scripts\python.exe"
 $env:VIRTUAL_ENV = $venv
 if (-not (Test-Path $py)) {
-    uv venv --python 3.12 $venv
-    if ($LASTEXITCODE) { throw "uv venv failed" }
+    $pyArg = if ($Python) { $Python } else { "3.12" }
+    if ($Offline) { uv venv --offline --python $pyArg $venv } else { uv venv --python $pyArg $venv }
+    if ($LASTEXITCODE) { throw "uv venv failed (offline machines: pass -Python <existing 3.10-3.12 interpreter>)" }
 }
-if (-not (Probe "import torch, sys; sys.exit(0 if torch.cuda.is_available() else 1)")) {
-    Write-Host "installing torch ($Cuda) ..."
-    uv pip install torch torchvision --index-url "https://download.pytorch.org/whl/$Cuda"
-    if ($LASTEXITCODE) { throw "torch install failed" }
-}
-if (-not (Probe "import flex_gemm, moge, triton")) {
-    Write-Host "installing MoGe + dependencies ..."
-    uv pip install -e (Join-Path $root "third_party\MoGe")
-    if ($LASTEXITCODE) { throw "MoGe install failed" }
-    uv pip install triton-windows safetensors "opencv-python-headless<5"
-    if ($LASTEXITCODE) { throw "dependency install failed" }
+if ($Offline) {
+    if (-not (Probe "import torch, triton, flex_gemm, moge")) {
+        Write-Host "installing from wheelhouse $Offline ..."
+        uv pip install --offline --no-index --find-links $Offline -r (Join-Path $Offline "requirements.txt")
+        if ($LASTEXITCODE) { throw "wheelhouse install failed" }
+        uv pip install --offline --no-index --find-links $Offline --no-deps -e (Join-Path $root "third_party\MoGe")
+        if ($LASTEXITCODE) { throw "MoGe install failed" }
+    }
+} else {
+    if (-not (Probe "import torch, sys; sys.exit(0 if torch.cuda.is_available() else 1)")) {
+        Write-Host "installing torch ($Cuda) ..."
+        uv pip install torch torchvision --index-url "https://download.pytorch.org/whl/$Cuda"
+        if ($LASTEXITCODE) { throw "torch install failed" }
+    }
+    if (-not (Probe "import flex_gemm, moge, triton")) {
+        Write-Host "installing MoGe + dependencies ..."
+        uv pip install -e (Join-Path $root "third_party\MoGe")
+        if ($LASTEXITCODE) { throw "MoGe install failed" }
+        uv pip install triton-windows safetensors "opencv-python-headless<5"
+        if ($LASTEXITCODE) { throw "dependency install failed" }
+    }
 }
 & $py -c "import torch, triton, flex_gemm, moge; print('torch', torch.__version__, '| cuda', torch.version.cuda, '| gpu', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'NONE')"
 if ($LASTEXITCODE) { throw "environment check failed" }
@@ -68,8 +87,14 @@ if ($LASTEXITCODE) { throw "environment check failed" }
 # ---------------------------------------------------------------- 2. model
 if (-not $SkipModel) {
     Step "Model checkpoint"
-    & $py (Join-Path $root "tools\download_model.py")
-    if ($LASTEXITCODE) { throw "model download failed" }
+    if ($Offline) {
+        $have = Get-ChildItem (Join-Path $root "models") -Filter "moge-3-vitg.*" -ErrorAction SilentlyContinue
+        if (-not $have) { throw "offline: put the checkpoint in models\ first (see docs\OFFLINE.md)" }
+        $have | ForEach-Object { Write-Host "present: $($_.FullName)" }
+    } else {
+        & $py (Join-Path $root "tools\download_model.py")
+        if ($LASTEXITCODE) { throw "model download failed" }
+    }
 }
 
 # ---------------------------------------------------------------- 3. plugin
@@ -121,8 +146,9 @@ $cfg = @(
     "python=$rootFwd/.venv/Scripts/python.exe",
     "daemon=$rootFwd/daemon/moge_daemon.py"
 )
-$model = Join-Path $root "models\moge-3-vitg.pt"
-if (Test-Path $model) { $cfg += "model=$rootFwd/models/moge-3-vitg.pt" }
+foreach ($name in @("moge-3-vitg.safetensors", "moge-3-vitg.pt")) {
+    if (Test-Path (Join-Path $root "models\$name")) { $cfg += "model=$rootFwd/models/$name"; break }
+}
 Set-Content -Path (Join-Path $installed "Contents\Win64\moge3.cfg") -Value $cfg -Encoding ASCII
 Write-Host "installed: $installed"
 

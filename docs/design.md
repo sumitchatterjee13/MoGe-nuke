@@ -81,3 +81,12 @@ auto-start off -> clear message naming the port and the start command.
 Built, installed to `~/.nuke/OFXPlugins/MoGe3.ofx.bundle`, tests passing.
 Build note: VS 2022 is an incomplete install, so build.ps1 uses vcvars64 +
 Ninja rather than the Visual Studio generator.
+
+## 2026-09-09 later: Linux + air-gapped
+
+Plugin ported to POSIX (sockets, posix_spawn with a filtered environment,
+dladdr for the config file); `ofx/tests/mini_host.cpp` is a minimal OFX host
+used to verify the built plugin on both platforms without Nuke. `install.sh`,
+`tools/make_wheelhouse.*` and `docs/OFFLINE.md` cover offline installs; the
+wheelhouse path was exercised with all network access blocked. Weights are
+also published as safetensors at Sumitc13/moge-3-vitg-safetensors.

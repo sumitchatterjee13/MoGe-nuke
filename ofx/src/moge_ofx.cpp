@@ -12,17 +12,41 @@
 //
 // Build: see ../CMakeLists.txt / ../build.ps1 (or use ../prebuilt)
 
+#ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #define _CRT_SECURE_NO_WARNINGS
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+typedef SOCKET sock_t;
+#else
+#include <arpa/inet.h>
+#include <dlfcn.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <signal.h>
+#include <spawn.h>
+#include <sys/select.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+typedef int sock_t;
+#define INVALID_SOCKET (-1)
+#define SOCKET_ERROR (-1)
+extern char **environ;
+#endif
 
 #include <algorithm>
 #include <cmath>
+#include <cstdarg>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <string>
@@ -36,7 +60,9 @@
 #include "ofxProgress.h"
 #include "ofxProperty.h"
 
+#ifdef _WIN32
 #pragma comment(lib, "ws2_32.lib")
+#endif
 
 #define PLUGIN_ID "com.sumit.moge3"
 #define PLUGIN_LABEL "MoGe3"
@@ -126,7 +152,7 @@ struct Instance {
         pColorspace, pNormalSpace, pApplyMask, pPython, pDaemon, pPort, pAutoStart,
         pExitWithHost;
 
-    SOCKET sock = INVALID_SOCKET;
+    sock_t sock = INVALID_SOCKET;
 
     // cache of the last daemon reply
     bool cacheValid = false;
@@ -137,7 +163,6 @@ struct Instance {
 };
 
 static std::mutex gSpawnMutex;
-static bool fileExists(const std::string &p);
 
 // ---------------------------------------------------------------------------
 // small helpers
@@ -176,12 +201,97 @@ static uint64_t fnv1a(const void *data, size_t n) {
     return h;
 }
 
+#ifdef _WIN32
 static std::wstring widen(const std::string &s) {
     if (s.empty()) return L"";
     int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0);
     std::wstring w(n, 0);
     MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), &w[0], n);
     return w;
+}
+#endif
+
+// ---------------------------------------------------------------------------
+// platform layer
+// ---------------------------------------------------------------------------
+
+static void closeSock(sock_t s) {
+#ifdef _WIN32
+    closesocket(s);
+#else
+    close(s);
+#endif
+}
+
+static void sleepMs(int ms) {
+#ifdef _WIN32
+    Sleep(ms);
+#else
+    usleep(ms * 1000);
+#endif
+}
+
+static bool fileExists(const std::string &p) {
+    if (p.empty()) return false;
+#ifdef _WIN32
+    return GetFileAttributesW(widen(p).c_str()) != INVALID_FILE_ATTRIBUTES;
+#else
+    struct stat st;
+    return stat(p.c_str(), &st) == 0;
+#endif
+}
+
+static long currentPid() {
+#ifdef _WIN32
+    return (long)GetCurrentProcessId();
+#else
+    return (long)getpid();
+#endif
+}
+
+static std::string envVar(const char *name) {
+#ifdef _WIN32
+    wchar_t buf[4096];
+    DWORD n = GetEnvironmentVariableW(widen(name).c_str(), buf, 4096);
+    if (n == 0 || n >= 4096) return "";
+    int m = WideCharToMultiByte(CP_UTF8, 0, buf, (int)n, nullptr, 0, nullptr, nullptr);
+    std::string out(m, 0);
+    WideCharToMultiByte(CP_UTF8, 0, buf, (int)n, &out[0], m, nullptr, nullptr);
+    return out;
+#else
+    const char *v = getenv(name);
+    return v ? v : "";
+#endif
+}
+
+// Directory containing this .ofx.
+static std::string pluginDir() {
+    std::string path;
+#ifdef _WIN32
+    HMODULE hm = nullptr;
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                       (LPCWSTR)&pluginDir, &hm);
+    wchar_t buf[4096];
+    DWORD n = GetModuleFileNameW(hm, buf, 4096);
+    if (n == 0) return "";
+    int m = WideCharToMultiByte(CP_UTF8, 0, buf, (int)n, nullptr, 0, nullptr, nullptr);
+    path.assign(m, 0);
+    WideCharToMultiByte(CP_UTF8, 0, buf, (int)n, &path[0], m, nullptr, nullptr);
+#else
+    Dl_info info;
+    if (dladdr((void *)&pluginDir, &info) == 0 || !info.dli_fname) return "";
+    path = info.dli_fname;
+#endif
+    size_t cut = path.find_last_of("/\\");
+    return cut == std::string::npos ? "" : path.substr(0, cut);
+}
+
+static FILE *openRead(const std::string &p) {
+#ifdef _WIN32
+    return _wfopen(widen(p).c_str(), L"rb");
+#else
+    return fopen(p.c_str(), "rb");
+#endif
 }
 
 static void showError(Instance *inst, const std::string &msg) {
@@ -236,7 +346,7 @@ static Params readParams(Instance *in, double t) {
 // daemon client
 // ---------------------------------------------------------------------------
 
-static bool sendAll(SOCKET s, const void *data, size_t n) {
+static bool sendAll(sock_t s, const void *data, size_t n) {
     const char *p = (const char *)data;
     while (n > 0) {
         int k = send(s, p, (int)std::min<size_t>(n, 1 << 20), 0);
@@ -247,7 +357,7 @@ static bool sendAll(SOCKET s, const void *data, size_t n) {
     return true;
 }
 
-static bool recvAll(SOCKET s, void *data, size_t n) {
+static bool recvAll(sock_t s, void *data, size_t n) {
     char *p = (char *)data;
     while (n > 0) {
         int k = recv(s, p, (int)std::min<size_t>(n, 1 << 20), 0);
@@ -258,20 +368,37 @@ static bool recvAll(SOCKET s, void *data, size_t n) {
     return true;
 }
 
-static SOCKET tryConnect(int port, int timeoutMs) {
-    SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+static void setNonBlocking(sock_t s, bool on) {
+#ifdef _WIN32
+    u_long v = on ? 1 : 0;
+    ioctlsocket(s, FIONBIO, &v);
+#else
+    int flags = fcntl(s, F_GETFL, 0);
+    fcntl(s, F_SETFL, on ? (flags | O_NONBLOCK) : (flags & ~O_NONBLOCK));
+#endif
+}
+
+static bool connectInProgress() {
+#ifdef _WIN32
+    return WSAGetLastError() == WSAEWOULDBLOCK;
+#else
+    return errno == EINPROGRESS;
+#endif
+}
+
+static sock_t tryConnect(int port, int timeoutMs) {
+    sock_t s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (s == INVALID_SOCKET) return INVALID_SOCKET;
     sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
-    addr.sin_port = htons((u_short)port);
+    addr.sin_port = htons((unsigned short)port);
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
 
-    u_long nonblock = 1;
-    ioctlsocket(s, FIONBIO, &nonblock);
+    setNonBlocking(s, true);
     int r = connect(s, (sockaddr *)&addr, sizeof(addr));
-    if (r == SOCKET_ERROR && WSAGetLastError() != WSAEWOULDBLOCK) {
-        closesocket(s);
+    if (r == SOCKET_ERROR && !connectInProgress()) {
+        closeSock(s);
         return INVALID_SOCKET;
     }
     fd_set wfds, efds;
@@ -282,24 +409,51 @@ static SOCKET tryConnect(int port, int timeoutMs) {
     timeval tv;
     tv.tv_sec = timeoutMs / 1000;
     tv.tv_usec = (timeoutMs % 1000) * 1000;
-    r = select(0, nullptr, &wfds, &efds, &tv);
-    if (r <= 0 || FD_ISSET(s, &efds)) {
-        closesocket(s);
+    r = select((int)s + 1, nullptr, &wfds, &efds, &tv);
+    int soerr = 0;
+    socklen_t slen = sizeof(soerr);
+    if (r > 0) getsockopt(s, SOL_SOCKET, SO_ERROR, (char *)&soerr, &slen);
+    if (r <= 0 || FD_ISSET(s, &efds) || soerr != 0) {
+        closeSock(s);
         return INVALID_SOCKET;
     }
-    nonblock = 0;
-    ioctlsocket(s, FIONBIO, &nonblock);
+    setNonBlocking(s, false);
     int one = 1;
     setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (const char *)&one, sizeof(one));
+#ifdef _WIN32
     DWORD to = 600 * 1000;  // model load + a 4K refine can take a while
+#else
+    timeval to;
+    to.tv_sec = 600;
+    to.tv_usec = 0;
+#endif
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&to, sizeof(to));
     setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char *)&to, sizeof(to));
     return s;
 }
 
-// Build an environment block for the daemon with Nuke's Python bootstrap
-// removed. Nuke sets PYTHONHOME to its own install; a child interpreter that
-// inherits it loads Nuke's stdlib and dies with "SRE module mismatch".
+// Nuke sets PYTHONHOME (and friends) to its own install; a child interpreter
+// that inherits them loads Nuke's stdlib and dies with "SRE module mismatch".
+static bool isPythonBootstrapVar(const std::string &entry) {
+    std::string upper = entry.substr(0, 18);
+    for (auto &ch : upper) ch = (char)toupper((unsigned char)ch);
+    return upper.rfind("PYTHONHOME=", 0) == 0 || upper.rfind("PYTHONPATH=", 0) == 0 ||
+           upper.rfind("PYTHONEXECUTABLE=", 0) == 0 || upper.rfind("PYTHONSTARTUP=", 0) == 0;
+}
+
+static std::string daemonLogPath() {
+#ifdef _WIN32
+    return "";  // the daemon gets its own console window instead
+#else
+    std::string dir = envVar("XDG_CACHE_HOME");
+    if (dir.empty()) dir = envVar("HOME") + "/.cache";
+    dir += "/moge-nuke";
+    mkdir(dir.c_str(), 0755);
+    return dir + "/daemon-" + std::to_string((long)getuid()) + ".log";
+#endif
+}
+
+#ifdef _WIN32
 static std::vector<wchar_t> daemonEnvBlock() {
     std::vector<wchar_t> block;
     wchar_t *env = GetEnvironmentStringsW();
@@ -307,13 +461,10 @@ static std::vector<wchar_t> daemonEnvBlock() {
     for (wchar_t *p = env; *p;) {
         size_t len = wcslen(p);
         std::wstring entry(p, len);
-        std::wstring upper = entry;
-        for (auto &ch : upper) ch = (wchar_t)towupper(ch);
-        bool drop = upper.rfind(L"PYTHONHOME=", 0) == 0 ||
-                    upper.rfind(L"PYTHONPATH=", 0) == 0 ||
-                    upper.rfind(L"PYTHONEXECUTABLE=", 0) == 0 ||
-                    upper.rfind(L"PYTHONSTARTUP=", 0) == 0;
-        if (!drop) {
+        int m = WideCharToMultiByte(CP_UTF8, 0, entry.c_str(), (int)entry.size(), nullptr, 0, nullptr, nullptr);
+        std::string narrowEntry(m, 0);
+        WideCharToMultiByte(CP_UTF8, 0, entry.c_str(), (int)entry.size(), &narrowEntry[0], m, nullptr, nullptr);
+        if (!isPythonBootstrapVar(narrowEntry)) {
             block.insert(block.end(), entry.begin(), entry.end());
             block.push_back(0);
         }
@@ -323,10 +474,36 @@ static std::vector<wchar_t> daemonEnvBlock() {
     FreeEnvironmentStringsW(env);
     return block;
 }
+#endif
 
-static bool spawnDaemon(const Params &p, std::string &err) {
+#ifdef _WIN32
+typedef HANDLE proc_t;
+#else
+typedef pid_t proc_t;
+#endif
+
+// True while the process we spawned is still running.
+static bool processAlive(proc_t h) {
+#ifdef _WIN32
+    return h && WaitForSingleObject(h, 0) == WAIT_TIMEOUT;
+#else
+    int status = 0;
+    return h > 0 && waitpid(h, &status, WNOHANG) == 0;
+#endif
+}
+
+static void releaseProcess(proc_t h) {
+#ifdef _WIN32
+    if (h) CloseHandle(h);
+#else
+    (void)h;
+#endif
+}
+
+static bool spawnDaemon(const Params &p, proc_t &proc, std::string &err) {
+    proc = (proc_t)0;
     if (!fileExists(p.python)) {
-        err = "python not found: '" + p.python + "'. Run install.ps1 from the MoGe-nuke repo, "
+        err = "python not found: '" + p.python + "'. Run the installer from the MoGe-nuke repo, "
               "or set 'python' on the Setup tab to the venv interpreter.";
         return false;
     }
@@ -334,10 +511,19 @@ static bool spawnDaemon(const Params &p, std::string &err) {
         err = "daemon script not found: '" + p.daemon + "'. Set it on the Setup tab.";
         return false;
     }
-    std::string cmd = "\"" + p.python + "\" \"" + p.daemon + "\" --model \"" + p.model +
-                      "\" --port " + std::to_string(p.port);
-    if (p.exitWithHost)  // daemon waits on our process handle and exits with us
-        cmd += " --parent-pid " + std::to_string(GetCurrentProcessId());
+    std::string cwd = p.daemon.substr(0, p.daemon.find_last_of("/\\"));
+    std::vector<std::string> argv = {p.python, p.daemon, "--model", p.model, "--port",
+                                     std::to_string(p.port)};
+    if (p.exitWithHost) {  // daemon watches our pid and exits with us
+        argv.push_back("--parent-pid");
+        argv.push_back(std::to_string(currentPid()));
+    }
+    std::string pretty;
+    for (auto &a : argv) pretty += (pretty.empty() ? "" : " ") + (a.find(' ') != std::string::npos ? "\"" + a + "\"" : a);
+
+#ifdef _WIN32
+    std::string cmd;
+    for (auto &a : argv) cmd += (cmd.empty() ? "\"" : " \"") + a + "\"";
     std::wstring wcmd = widen(cmd);
     std::vector<wchar_t> cmdbuf(wcmd.begin(), wcmd.end());
     cmdbuf.push_back(0);
@@ -350,7 +536,6 @@ static bool spawnDaemon(const Params &p, std::string &err) {
     si.wShowWindow = SW_SHOWMINNOACTIVE;  // own console, minimised, keeps focus in Nuke
     PROCESS_INFORMATION pi;
     memset(&pi, 0, sizeof(pi));
-    std::string cwd = p.daemon.substr(0, p.daemon.find_last_of("/\\"));
     std::wstring wcwd = widen(cwd);
     BOOL ok = CreateProcessW(nullptr, cmdbuf.data(), nullptr, nullptr, FALSE,
                              CREATE_NEW_CONSOLE | CREATE_UNICODE_ENVIRONMENT,
@@ -358,14 +543,47 @@ static bool spawnDaemon(const Params &p, std::string &err) {
                              wcwd.empty() ? nullptr : wcwd.c_str(), &si, &pi);
     if (!ok) {
         char b[256];
-        snprintf(b, sizeof(b), "CreateProcess failed (%lu) for: %s", GetLastError(), cmd.c_str());
+        snprintf(b, sizeof(b), "CreateProcess failed (%lu) for: %s", GetLastError(), pretty.c_str());
         err = b;
         return false;
     }
-    logf("started daemon pid %lu: %s", pi.dwProcessId, cmd.c_str());
+    logf("started daemon pid %lu: %s", pi.dwProcessId, pretty.c_str());
     CloseHandle(pi.hThread);
-    CloseHandle(pi.hProcess);
+    proc = pi.hProcess;
     return true;
+#else
+    std::vector<std::string> envStore;
+    for (char **e = environ; e && *e; ++e)
+        if (!isPythonBootstrapVar(*e)) envStore.push_back(*e);
+    std::vector<char *> envp;
+    for (auto &e : envStore) envp.push_back(&e[0]);
+    envp.push_back(nullptr);
+    std::vector<char *> args;
+    for (auto &a : argv) args.push_back(&a[0]);
+    args.push_back(nullptr);
+
+    std::string logPath = daemonLogPath();
+    posix_spawn_file_actions_t fa;
+    posix_spawn_file_actions_init(&fa);
+    posix_spawn_file_actions_addopen(&fa, 0, "/dev/null", O_RDONLY, 0);
+    posix_spawn_file_actions_addopen(&fa, 1, logPath.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
+    posix_spawn_file_actions_adddup2(&fa, 1, 2);
+    posix_spawn_file_actions_addchdir_np(&fa, cwd.c_str());
+    posix_spawnattr_t attr;
+    posix_spawnattr_init(&attr);
+    posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSID);  // own session: survives host SIGHUP
+    pid_t pid = 0;
+    int rc = posix_spawn(&pid, p.python.c_str(), &fa, &attr, args.data(), envp.data());
+    posix_spawn_file_actions_destroy(&fa);
+    posix_spawnattr_destroy(&attr);
+    if (rc != 0) {
+        err = std::string("posix_spawn failed (") + strerror(rc) + ") for: " + pretty;
+        return false;
+    }
+    logf("started daemon pid %ld (log: %s): %s", (long)pid, logPath.c_str(), pretty.c_str());
+    proc = pid;
+    return true;
+#endif
 }
 
 static bool ensureConnected(Instance *in, const Params &p, std::string &err) {
@@ -385,28 +603,40 @@ static bool ensureConnected(Instance *in, const Params &p, std::string &err) {
     in->sock = tryConnect(p.port, 500);
     if (in->sock != INVALID_SOCKET) return true;
 
-    if (!spawnDaemon(p, err)) return false;
+    proc_t proc;
+    if (!spawnDaemon(p, proc, err)) return false;
 
     if (gProgress) gProgress->progressStart(in->effect, "MoGe3: starting daemon and loading the model ...");
     const int maxWaitMs = 10 * 60 * 1000;
     int waited = 0;
-    bool aborted = false;
+    bool aborted = false, died = false;
     while (waited < maxWaitMs) {
         in->sock = tryConnect(p.port, 1000);
         if (in->sock != INVALID_SOCKET) break;
-        Sleep(1000);
+        sleepMs(1000);
         waited += 2000;
         if (gProgress) gProgress->progressUpdate(in->effect, std::min(0.95, waited / 90000.0));
+        if (!processAlive(proc)) {  // crashed on startup: do not sit out the timeout
+            died = true;
+            break;
+        }
         if (gEffect->abort(in->effect)) {
             aborted = true;
             break;
         }
     }
+    releaseProcess(proc);
     if (gProgress) gProgress->progressEnd(in->effect);
     if (in->sock == INVALID_SOCKET) {
-        err = aborted ? "cancelled while waiting for the daemon"
-                      : "daemon started but never answered on port " + std::to_string(p.port) +
-                            " -- check its console window";
+#ifdef _WIN32
+        std::string where = "check its console window";
+#else
+        std::string where = "see " + daemonLogPath();
+#endif
+        if (aborted) err = "cancelled while waiting for the daemon";
+        else if (died) err = "the daemon exited during startup (bad python/model path, missing "
+                             "packages, CUDA?) -- " + where;
+        else err = "daemon started but never answered on port " + std::to_string(p.port) + " -- " + where;
         return false;
     }
     return true;
@@ -437,13 +667,13 @@ static bool daemonInfer(Instance *in, const Params &p, int w, int h,
         unsigned char rh[24];
         if (ok) ok = recvAll(in->sock, rh, 24);
         if (!ok) {
-            closesocket(in->sock);
+            closeSock(in->sock);
             in->sock = INVALID_SOCKET;
             err = "connection to the daemon dropped";
             continue;  // reconnect once
         }
         if (memcmp(rh, "MOGR", 4) != 0) {
-            closesocket(in->sock);
+            closeSock(in->sock);
             in->sock = INVALID_SOCKET;
             err = "garbled reply from the daemon";
             return false;
@@ -457,21 +687,21 @@ static bool daemonInfer(Instance *in, const Params &p, int w, int h,
         memcpy(&mlen, rh + 20, 4);
         std::string msg(mlen, 0);
         if (mlen && !recvAll(in->sock, &msg[0], mlen)) {
-            closesocket(in->sock);
+            closeSock(in->sock);
             in->sock = INVALID_SOCKET;
             err = "connection dropped mid-reply";
             return false;
         }
         uint32_t plen;
         if (!recvAll(in->sock, &plen, 4)) {
-            closesocket(in->sock);
+            closeSock(in->sock);
             in->sock = INVALID_SOCKET;
             err = "connection dropped mid-reply";
             return false;
         }
         std::vector<float> payload(plen / sizeof(float));
         if (plen && !recvAll(in->sock, payload.data(), plen)) {
-            closesocket(in->sock);
+            closeSock(in->sock);
             in->sock = INVALID_SOCKET;
             err = "connection dropped mid-payload";
             return false;
@@ -496,35 +726,11 @@ static bool daemonInfer(Instance *in, const Params &p, int w, int h,
 // configuration
 // ---------------------------------------------------------------------------
 
-static std::string narrow(const std::wstring &w) {
-    if (w.empty()) return "";
-    int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), nullptr, 0, nullptr, nullptr);
-    std::string s(n, 0);
-    WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), &s[0], n, nullptr, nullptr);
-    return s;
-}
-
 static std::string trim(std::string s) {
     while (!s.empty() && (s.back() == ' ' || s.back() == '\r' || s.back() == '\n' || s.back() == '\t')) s.pop_back();
     size_t i = 0;
     while (i < s.size() && (s[i] == ' ' || s[i] == '\t')) ++i;
     return s.substr(i);
-}
-
-static std::string pluginDir() {
-    HMODULE hm = nullptr;
-    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                       (LPCWSTR)&pluginDir, &hm);
-    wchar_t buf[4096];
-    DWORD n = GetModuleFileNameW(hm, buf, 4096);
-    if (n == 0) return "";
-    std::string path = narrow(std::wstring(buf, n));
-    size_t cut = path.find_last_of("/\\");
-    return cut == std::string::npos ? "" : path.substr(0, cut);
-}
-
-static bool fileExists(const std::string &p) {
-    return !p.empty() && GetFileAttributesW(widen(p).c_str()) != INVALID_FILE_ATTRIBUTES;
 }
 
 static void loadConfig() {
@@ -533,7 +739,7 @@ static void loadConfig() {
 
     // 2. moge3.cfg beside the .ofx
     std::string cfgPath = pluginDir() + "/moge3.cfg";
-    if (FILE *f = _wfopen(widen(cfgPath).c_str(), L"rb")) {
+    if (FILE *f = openRead(cfgPath)) {
         char line[4096];
         while (fgets(line, sizeof(line), f)) {
             std::string l = trim(line);
@@ -551,17 +757,22 @@ static void loadConfig() {
         logf("config: %s", cfgPath.c_str());
     }
     // 1. environment wins over the file
-    wchar_t envRoot[4096];
-    if (GetEnvironmentVariableW(L"MOGE_NUKE_ROOT", envRoot, 4096) > 0) gRoot = narrow(envRoot);
+    std::string envRoot = envVar("MOGE_NUKE_ROOT");
+    if (!envRoot.empty()) gRoot = envRoot;
 
     for (auto &c : gRoot) if (c == '\\') c = '/';
     while (!gRoot.empty() && gRoot.back() == '/') gRoot.pop_back();
 
-    gDefaultPython = !python.empty() ? python : (gRoot.empty() ? "" : gRoot + "/.venv/Scripts/python.exe");
+#ifdef _WIN32
+    const char *venvPython = "/.venv/Scripts/python.exe";
+#else
+    const char *venvPython = "/.venv/bin/python";
+#endif
+    gDefaultPython = !python.empty() ? python : (gRoot.empty() ? "" : gRoot + venvPython);
     gDefaultDaemon = !daemon.empty() ? daemon : (gRoot.empty() ? "" : gRoot + "/daemon/moge_daemon.py");
     if (!model.empty()) gDefaultModel = model;
-    else if (!gRoot.empty() && fileExists(gRoot + "/models/moge-3-vitg.pt")) gDefaultModel = gRoot + "/models/moge-3-vitg.pt";
     else if (!gRoot.empty() && fileExists(gRoot + "/models/moge-3-vitg.safetensors")) gDefaultModel = gRoot + "/models/moge-3-vitg.safetensors";
+    else if (!gRoot.empty() && fileExists(gRoot + "/models/moge-3-vitg.pt")) gDefaultModel = gRoot + "/models/moge-3-vitg.pt";
     else gDefaultModel = kHfModel;
     if (port > 0) kDefaultPort = port;
 
@@ -584,13 +795,19 @@ static OfxStatus onLoad() {
     gMessage = (OfxMessageSuiteV1 *)gHost->fetchSuite(gHost->host, kOfxMessageSuite, 1);
     gProgress = (OfxProgressSuiteV1 *)gHost->fetchSuite(gHost->host, kOfxProgressSuite, 1);
     if (!gEffect || !gProp || !gParam) return kOfxStatErrMissingHostFeature;
+#ifdef _WIN32
     WSADATA wsa;
     WSAStartup(MAKEWORD(2, 2), &wsa);
+#else
+    signal(SIGPIPE, SIG_IGN);  // a dead daemon must not kill the host
+#endif
     return kOfxStatOK;
 }
 
 static OfxStatus onUnload() {
+#ifdef _WIN32
     WSACleanup();
+#endif
     return kOfxStatOK;
 }
 
@@ -792,7 +1009,7 @@ static Instance *getInstance(OfxImageEffectHandle effect) {
 static OfxStatus destroyInstance(OfxImageEffectHandle effect) {
     Instance *in = getInstance(effect);
     if (in) {
-        if (in->sock != INVALID_SOCKET) closesocket(in->sock);
+        if (in->sock != INVALID_SOCKET) closeSock(in->sock);
         delete in;
     }
     return kOfxStatOK;
@@ -991,7 +1208,13 @@ static OfxPlugin gPlugin = {
     pluginMain,
 };
 
+#ifndef _WIN32
+#define OFX_VISIBLE __attribute__((visibility("default")))
+#else
+#define OFX_VISIBLE
+#endif
+
 extern "C" {
-OfxExport int OfxGetNumberOfPlugins(void) { return 1; }
-OfxExport OfxPlugin *OfxGetPlugin(int nth) { return nth == 0 ? &gPlugin : nullptr; }
+OFX_VISIBLE OfxExport int OfxGetNumberOfPlugins(void) { return 1; }
+OFX_VISIBLE OfxExport OfxPlugin *OfxGetPlugin(int nth) { return nth == 0 ? &gPlugin : nullptr; }
 }

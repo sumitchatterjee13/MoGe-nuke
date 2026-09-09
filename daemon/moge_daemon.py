@@ -163,6 +163,22 @@ def pack_reply(status, msg, width=0, height=0, channels=0, data=b""):
 # model
 # ---------------------------------------------------------------------------
 
+def load_from_hub(repo_id, device):
+    """Fetch a checkpoint from a Hugging Face repo: model.safetensors if the
+    repo has one (faster, mmap-loaded), else MoGe's model.pt."""
+    from huggingface_hub import hf_hub_download
+    from huggingface_hub.utils import EntryNotFoundError
+    from moge.model.v3 import MoGeModel
+    try:
+        path = hf_hub_download(repo_id=repo_id, repo_type="model", filename="model.safetensors")
+    except EntryNotFoundError:
+        path = None
+    if path:
+        from moge_safetensors import load_moge
+        return load_moge(path, device)
+    return MoGeModel.from_pretrained(repo_id).to(device).eval()
+
+
 class Engine:
     """Owns the model; one inference at a time."""
 
@@ -202,7 +218,7 @@ class Engine:
             self.model = model.to(self.device).eval()
         else:
             log("not a local file; fetching from Hugging Face (cached after the first time)")
-            self.model = MoGeModel.from_pretrained(path).to(self.device).eval()
+            self.model = load_from_hub(path, self.device)
         self.model_path = path
         self.load_time = time.time() - t0
         log("model ready in {0:.1f}s".format(self.load_time))
@@ -392,6 +408,11 @@ def main(argv=None):
 
     if args.parent_pid > 0:
         watch_parent(args.parent_pid)
+
+    if os.path.isfile(args.model):
+        # a local checkpoint never needs the network; keep huggingface_hub
+        # from probing it (air-gapped machines have no route out)
+        os.environ.setdefault("HF_HUB_OFFLINE", "1")
 
     import torch
     device = args.device

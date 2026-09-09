@@ -1,0 +1,22 @@
+# systemd user unit: keep the MoGe daemon resident (farm blades, shared
+# workstations). Install:
+#   mkdir -p ~/.config/systemd/user
+#   sed "s#@ROOT@#$PWD#g" docs/moge3-daemon.service > ~/.config/systemd/user/moge3-daemon.service
+#   systemctl --user daemon-reload && systemctl --user enable --now moge3-daemon
+# Then turn OFF "daemon exits with Nuke" on the node (or leave it: a node
+# only starts a daemon when nothing answers on the port).
+[Unit]
+Description=MoGe-3 inference daemon for Nuke (MoGe-nuke)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=@ROOT@/daemon
+ExecStart=@ROOT@/.venv/bin/python @ROOT@/daemon/moge_daemon.py --model @ROOT@/models/moge-3-vitg.safetensors --port 47821
+Environment=HF_HUB_OFFLINE=1
+# Environment=TRITON_CACHE_DIR=/shared/triton-cache
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
